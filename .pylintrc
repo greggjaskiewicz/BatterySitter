@@ -1,0 +1,59 @@
+[MASTER]
+# Python code to execute, usually for sys.path manipulation such as
+# pygtk.require().
+#init-hook=
+
+[MESSAGES CONTROL]
+# Disable specific warnings that are intentional or stylistic choices
+disable=
+    # We prefer f-strings over % formatting for readability
+    logging-fstring-interpolation,
+    # Complex state machine requires many attributes
+    too-many-instance-attributes,
+    # Configuration requires many parameters
+    too-many-arguments,
+    too-many-positional-arguments,
+    # Intentional broad exception catching for robustness
+    broad-exception-caught,
+    # Monitor loop is complex by nature
+    too-many-branches,
+    too-many-statements,
+    # Duplicate code between main script and test harness is expected
+    duplicate-code,
+    # Lazy imports for optional/conditional dependencies
+    import-outside-toplevel,
+    # Dependencies may not be installed in linting environment
+    import-error
+
+[FORMAT]
+# Maximum number of characters on a single line
+max-line-length=100
+
+# String used as indentation unit
+indent-string='    '
+
+[DESIGN]
+# Maximum number of arguments for function / method
+max-args=10
+
+# Maximum number of attributes for a class
+max-attributes=15
+
+# Maximum number of branch for function / method body
+max-branches=20
+
+# Maximum number of statements in function / method body
+max-statements=60
+
+[BASIC]
+# Good variable names which should always be accepted, separated by a comma
+good-names=i,j,k,ex,Run,_,f,e
+
+[TYPECHECK]
+# List of members which are set dynamically and missed by pylint inference
+# system (useful for classes with dynamic __getattr__ or __setattr__)
+generated-members=
+
+[SIMILARITIES]
+# Minimum lines number of a similarity
+min-similarity-lines=10

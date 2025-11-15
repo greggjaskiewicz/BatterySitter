@@ -20,7 +20,7 @@ def load_config(config_path='config.json'):
         sys.exit(1)
 
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON in {config_path}: {e}")

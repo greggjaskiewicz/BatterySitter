@@ -10,7 +10,6 @@ power is used for EV charging instead of depleting the home battery.
 import asyncio
 import logging
 import sys
-from datetime import datetime
 from typing import Optional
 import signal
 
@@ -184,10 +183,14 @@ class BatterySitter:
             self.logger.error(f"Error setting operational mode: {e}")
             raise
 
-    async def set_instant_manual_charge(self, enable: bool, duration_minutes: int = 30, power_kw: float = 1.0, mode: str = "0"):
+    async def set_instant_manual_charge(
+        self, enable: bool, duration_minutes: int = 30,
+        power_kw: float = 1.0, mode: str = "0"
+    ):
         """
         Set instant manual charge control for the battery.
-        This allows forcing the battery to charge from the grid for a specific duration at a specific rate.
+        This allows forcing the battery to charge from the grid for a
+        specific duration at a specific rate.
 
         Args:
             enable: True to enable manual charging, False to disable
@@ -207,7 +210,8 @@ class BatterySitter:
         """
         try:
             await self.sigen.ensure_valid_token()
-            url = f"{self.sigen.BASE_URL}device/energy-profile/instant/manunal"  # Note: API has typo "manunal"
+            # Note: API has typo "manunal"
+            url = f"{self.sigen.BASE_URL}device/energy-profile/instant/manunal"
             payload = {
                 'enable': enable,
                 'stationId': self.sigen.station_id,
@@ -218,11 +222,16 @@ class BatterySitter:
 
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                async with session.put(url, headers=self.sigen.headers, json=payload) as response:
+                async with session.put(
+                    url, headers=self.sigen.headers, json=payload
+                ) as response:
                     result = await response.json()
 
                     if enable:
-                        self.logger.info(f"Enabled instant manual charge: {power_kw}kW for {duration_minutes} minutes")
+                        self.logger.info(
+                            f"Enabled instant manual charge: "
+                            f"{power_kw}kW for {duration_minutes} minutes"
+                        )
                     else:
                         self.logger.info("Disabled instant manual charge")
 
@@ -250,16 +259,29 @@ class BatterySitter:
                 # Get battery/energy info for logging
                 battery_info = await self.get_battery_info()
                 if not battery_info:
-                    self.logger.warning("Battery info unavailable - get_battery_info() returned empty dict")
+                    self.logger.warning(
+                        "Battery info unavailable - "
+                        "get_battery_info() returned empty dict"
+                    )
                 battery_soc = battery_info.get('batterySoc', 'N/A')
-                battery_power = battery_info.get('batteryPower', 'N/A')  # Positive = charging, Negative = discharging
+                # Positive = charging, Negative = discharging
+                battery_power = battery_info.get('batteryPower', 'N/A')
 
                 # Debug log the raw values if they're not numeric
-                if not isinstance(battery_power, (int, float)) or not isinstance(battery_soc, (int, float)):
-                    self.logger.debug(f"Non-numeric battery data - SOC: {battery_soc} (type: {type(battery_soc).__name__}), Power: {battery_power} (type: {type(battery_power).__name__})")
+                if not isinstance(battery_power, (int, float)) or \
+                   not isinstance(battery_soc, (int, float)):
+                    self.logger.debug(
+                        f"Non-numeric battery data - "
+                        f"SOC: {battery_soc} (type: {type(battery_soc).__name__}), "
+                        f"Power: {battery_power} (type: {type(battery_power).__name__})"
+                    )
 
-                # Check if battery is already charging from another source (AI, timer, etc.)
-                battery_already_charging = isinstance(battery_power, (int, float)) and battery_power > 0
+                # Check if battery is already charging from another source
+                # (AI, timer, etc.)
+                battery_already_charging = (
+                    isinstance(battery_power, (int, float)) and
+                    battery_power > 0
+                )
 
                 # Handle state changes
                 if zappi_charging and not self.is_charging:
@@ -270,15 +292,22 @@ class BatterySitter:
                     )
 
                     if battery_already_charging:
-                        self.logger.info("Battery is already charging - not overriding existing charge control")
+                        self.logger.info(
+                            "Battery is already charging - "
+                            "not overriding existing charge control"
+                        )
                         self.is_charging = True
                         self.manual_charge_enabled = False
                     else:
                         # Enable instant manual charge at 1kW for 30 minutes
                         self.logger.info(
-                            f"Battery not charging - enabling instant manual charge ({self.charging_power}kW for 30min)"
+                            f"Battery not charging - enabling instant manual "
+                            f"charge ({self.charging_power}kW for 30min)"
                         )
-                        await self.set_instant_manual_charge(enable=True, duration_minutes=30, power_kw=self.charging_power)
+                        await self.set_instant_manual_charge(
+                            enable=True, duration_minutes=30,
+                            power_kw=self.charging_power
+                        )
                         self.is_charging = True
                         self.manual_charge_enabled = True
 
@@ -292,7 +321,9 @@ class BatterySitter:
                     # Disable instant manual charge only if WE enabled it
                     if self.manual_charge_enabled:
                         self.logger.info("Disabling instant manual battery charge")
-                        await self.set_instant_manual_charge(enable=False, duration_minutes=0, power_kw=0)
+                        await self.set_instant_manual_charge(
+                            enable=False, duration_minutes=0, power_kw=0
+                        )
                         self.manual_charge_enabled = False
 
                     self.is_charging = False
@@ -306,30 +337,44 @@ class BatterySitter:
                             f"(SOC: {battery_soc}%, Power: {battery_power}W)"
                         )
                     else:
-                        # Battery is NOT charging - enable manual charge if we haven't already
+                        # Battery is NOT charging - enable manual charge
+                        # if we haven't already
                         if not self.manual_charge_enabled:
                             self.logger.info(
-                                f"Battery not charging - enabling instant manual charge ({self.charging_power}kW for 30min)"
+                                f"Battery not charging - enabling instant manual "
+                                f"charge ({self.charging_power}kW for 30min)"
                             )
-                            await self.set_instant_manual_charge(enable=True, duration_minutes=30, power_kw=self.charging_power)
+                            await self.set_instant_manual_charge(
+                                enable=True, duration_minutes=30,
+                                power_kw=self.charging_power
+                            )
                             self.manual_charge_enabled = True
                         else:
-                            # Battery stopped charging even though we enabled it - something might be wrong
+                            # Battery stopped charging even though we enabled it
+                            # - something might be wrong
                             self.logger.warning(
-                                f"Battery not charging despite manual charge enabled "
-                                f"(SOC: {battery_soc}%, Power: {battery_power}W)"
+                                f"Battery not charging despite manual charge "
+                                f"enabled (SOC: {battery_soc}%, Power: {battery_power}W)"
                             )
 
                 else:
                     # No state change - just log status periodically
                     if isinstance(battery_power, (int, float)):
-                        power_status = "charging" if battery_power > 0 else "discharging" if battery_power < 0 else "idle"
+                        if battery_power > 0:
+                            power_status = "charging"
+                        elif battery_power < 0:
+                            power_status = "discharging"
+                        else:
+                            power_status = "idle"
                         self.logger.debug(
                             f"Status: idle, Battery SOC: {battery_soc}%, "
                             f"Battery {power_status}: {abs(battery_power)}W"
                         )
                     else:
-                        self.logger.debug(f"Status: idle, Battery SOC: {battery_soc}% (battery power: {battery_power})")
+                        self.logger.debug(
+                            f"Status: idle, Battery SOC: {battery_soc}% "
+                            f"(battery power: {battery_power})"
+                        )
 
                 # Wait before next poll
                 await asyncio.sleep(self.poll_interval)
@@ -398,7 +443,7 @@ async def main():
         logger.error("Please copy config.example.json to config.json and configure it")
         sys.exit(1)
 
-    with open('config.json', 'r') as f:
+    with open('config.json', 'r', encoding='utf-8') as f:
         config = json.load(f)
 
     sitter = BatterySitter(
@@ -415,7 +460,7 @@ async def main():
     # Handle signals for graceful shutdown
     loop = asyncio.get_event_loop()
 
-    def signal_handler(sig, frame):
+    def signal_handler(sig, _frame):
         logger.info(f"Received signal {sig}")
         loop.create_task(sitter.shutdown())
         loop.stop()
