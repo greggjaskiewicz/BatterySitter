@@ -193,6 +193,7 @@ The `charging_power` setting controls how much power (in kW) the battery charges
 
 - **[pymyenergi](https://github.com/CJNE/pymyenergi)**: Async Python library for MyEnergi devices (Zappi, Eddi, Harvi)
 - **[sigen](https://pypi.org/project/sigen/)**: Python library for Sigenergy cloud API
+  - **Note**: The original GitHub repository is no longer accessible. A backup copy (v0.1.9) is maintained in the `vendor/` directory for archival purposes.
 
 ## License
 
