@@ -1,0 +1,24 @@
+[Unit]
+Description=BatterySitter - Prevents Sigenstore battery discharge during Zappi EV charging
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/BatterySitter
+ExecStart=/home/pi/BatterySitter/venv/bin/python3 /home/pi/BatterySitter/run.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/pi/BatterySitter/battery_sitter.log
+StandardError=append:/home/pi/BatterySitter/battery_sitter_error.log
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

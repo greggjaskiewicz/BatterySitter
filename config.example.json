@@ -1,0 +1,16 @@
+{
+  "zappi": {
+    "username": "12345678",
+    "password": "your-api-key-here",
+    "serial": "10000001"
+  },
+  "sigenergy": {
+    "username": "your-email@example.com",
+    "password": "your-password",
+    "region": "eu",
+    "charging_power": 1
+  },
+  "polling": {
+    "interval_seconds": 30
+  }
+}

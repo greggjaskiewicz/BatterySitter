@@ -1,0 +1,12 @@
+# BatterySitter dependencies
+
+# MyEnergi (Zappi) integration
+pymyenergi>=0.2.3
+
+# Sigenergy (Sigenstore) integration
+sigen>=0.1.9
+
+# Already included as dependencies but listed for clarity:
+# aiohttp>=3.8.0
+# pycryptodome>=3.15.0
+# requests>=2.28.0
