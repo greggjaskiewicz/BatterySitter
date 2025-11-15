@@ -1,4 +1,7 @@
 [MASTER]
+# Ignore vendored third-party code
+ignore-paths=^vendor/.*
+
 # Python code to execute, usually for sys.path manipulation such as
 # pygtk.require().
 #init-hook=
