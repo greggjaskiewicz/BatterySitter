@@ -138,6 +138,10 @@ class BatterySitter:
         """
         try:
             energy_flow = await self.sigen.get_energy_flow()
+            # Handle case where API returns None instead of raising exception
+            if energy_flow is None:
+                self.logger.warning("get_energy_flow() returned None")
+                return {}
             return energy_flow
         except Exception as e:
             self.logger.error(f"Error reading battery info: {e}")
@@ -350,7 +354,7 @@ class BatterySitter:
                             )
                             self.manual_charge_enabled = True
                         else:
-                            # Battery stopped charging even though we enabled it
+                            # The battery stopped charging even though we enabled it
                             # - something might be wrong
                             self.logger.warning(
                                 f"Battery not charging despite manual charge "
