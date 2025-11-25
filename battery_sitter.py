@@ -11,6 +11,7 @@ import asyncio
 import logging
 import sys
 from typing import Optional
+from datetime import datetime, timedelta
 import signal
 
 from pymyenergi.connection import Connection
@@ -65,6 +66,8 @@ class BatterySitter:
         self.is_charging = False
         self.running = False
         self.manual_charge_enabled = False  # Track if WE enabled manual charge
+        self.last_connection_time: Optional[datetime] = None
+        self.reconnect_interval = timedelta(hours=8)  # Reconnect every 8 hours
 
     async def connect(self):
         """Establish connections to Zappi and Sigenstore"""
@@ -92,6 +95,7 @@ class BatterySitter:
         current_mode = await self.sigen.get_operational_mode()
         self.logger.info(f"Current operational mode: {current_mode}")
 
+        self.last_connection_time = datetime.now()
         self.logger.info("Successfully connected to both devices")
 
     async def disconnect(self):
@@ -257,6 +261,15 @@ class BatterySitter:
 
         while self.running:
             try:
+                # Periodic reconnection to refresh tokens/sessions
+                if self.last_connection_time:
+                    time_since_connection = datetime.now() - self.last_connection_time
+                    if time_since_connection >= self.reconnect_interval:
+                        self.logger.info(
+                            f"Reconnecting after {time_since_connection.total_seconds() / 3600:.1f} hours"
+                        )
+                        await self.connect()
+
                 # Check Zappi charging status
                 zappi_charging = await self.get_zappi_charging_status()
 
@@ -341,25 +354,28 @@ class BatterySitter:
                             f"(SOC: {battery_soc}%, Power: {battery_power}W)"
                         )
                     else:
-                        # Battery is NOT charging - enable manual charge
-                        # if we haven't already
+                        # Battery is NOT charging - enable/re-enable manual charge
                         if not self.manual_charge_enabled:
                             self.logger.info(
                                 f"Battery not charging - enabling instant manual "
                                 f"charge ({self.charging_power}kW for 30min)"
                             )
-                            await self.set_instant_manual_charge(
-                                enable=True, duration_minutes=30,
-                                power_kw=self.charging_power
-                            )
-                            self.manual_charge_enabled = True
                         else:
-                            # The battery stopped charging even though we enabled it
-                            # - something might be wrong
+                            # Battery stopped charging even though we enabled it
+                            # (API failure, timer expired, or SOC at 100%)
+                            # Re-enable to ensure it charges
                             self.logger.warning(
                                 f"Battery not charging despite manual charge "
-                                f"enabled (SOC: {battery_soc}%, Power: {battery_power}W)"
+                                f"enabled (SOC: {battery_soc}%, Power: {battery_power}W) "
+                                f"- retrying enable"
                             )
+
+                        # Always (re-)enable when battery should be charging but isn't
+                        await self.set_instant_manual_charge(
+                            enable=True, duration_minutes=30,
+                            power_kw=self.charging_power
+                        )
+                        self.manual_charge_enabled = True
 
                 else:
                     # No state change - just log status periodically
