@@ -10,7 +10,7 @@ When charging an EV with a Zappi charger, the Sigenstore battery may discharge t
 
 BatterySitter monitors your Zappi charger status and automatically enables battery charging when EV charging is detected:
 
-- **EV Charging Detected** → Enable instant manual battery charge (e.g., 1kW for 30min) to pull from grid
+- **EV Charging Detected** → Enable instant manual battery charge (e.g., 1kW for default 30min; configurable) to pull from grid
 - **EV Charging Stopped** → Disable manual charge, return to normal operation
 - **Smart Detection** → If battery is already charging (via AI/timer), doesn't interfere
 
@@ -140,6 +140,7 @@ Edit `config.json` to customize:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `sigenergy.charging_power` | Battery charge power in kW when EV charging | 1 |
+| `sigenergy.charging_duration_minutes` | Minutes to keep manual charge active when EV charging is detected | 30 |
 | `polling.interval_seconds` | Seconds between status checks | 30 |
 
 ### Charging Power
@@ -155,7 +156,7 @@ The `charging_power` setting controls how much power (in kW) the battery charges
 2. **Detection**: When Zappi status changes to "Charging" or "Boosting" with EV connected
 3. **Smart Intervention**:
    - Checks if battery is already charging (from AI mode, timer, etc.)
-   - If battery NOT charging: Enables instant manual charge at configured power (e.g., 1kW) for 30min
+   - If battery NOT charging: Enables instant manual charge at configured power (e.g., 1kW) for configured duration (default 30min)
    - If battery IS charging: Does nothing (respects existing charge control)
 4. **Monitoring**: Continues checking battery charge status during EV charging
    - If battery stops charging unexpectedly, re-enables manual charge

@@ -8,7 +8,8 @@
     "username": "your-email@example.com",
     "password": "your-password",
     "region": "eu",
-    "charging_power": 1
+    "charging_power": 1,
+    "charging_duration_minutes": 30
   },
   "polling": {
     "interval_seconds": 30
