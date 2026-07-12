@@ -11,6 +11,16 @@ logging.basicConfig(level=logging.INFO,
 
 logger = logging.getLogger(__name__)
 
+# Sigenergy's CloudFront WAF blocks Python HTTP client user-agents
+# (403 "Request blocked" before the request ever reaches the API), so
+# every session must present browser-like headers.
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                  'Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+}
+
 REGION_BASE_URLS = {
     'eu': "https://api-eu.sigencloud.com/",
     'cn': "https://api-cn.sigencloud.com/",
@@ -71,7 +81,7 @@ class Sigen:
             'password': self.password,
             'grant_type': 'password'
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.post(url, data=data, auth=aiohttp.BasicAuth('sigen', 'sigen')) as response:
                 if response.status == 401:
                     raise Exception(
@@ -103,7 +113,7 @@ class Sigen:
             'grant_type': 'refresh_token',
             'refresh_token': self.refresh_token
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.post(url, data=data, auth=aiohttp.BasicAuth('sigen', 'sigen')) as response:
                 if response.status == 200:
                     response_json = await response.json()
@@ -127,7 +137,7 @@ class Sigen:
     async def fetch_station_info(self):
         await self.ensure_valid_token()
         url = f"{self.BASE_URL}device/owner/station/home"
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers) as response:
                 data = (await response.json())['data']
                 self.station_id = data['stationId']
@@ -153,14 +163,14 @@ class Sigen:
     async def get_energy_flow(self):
         await self.ensure_valid_token()
         url = f"{self.BASE_URL}device/sigen/station/energyflow?id={self.station_id}"
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers) as response:
                 return (await response.json())['data']
 
     async def get_operational_mode(self):
         await self.ensure_valid_token()
         url = f"{self.BASE_URL}device/setting/operational/mode/{self.station_id}"
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers) as response:
                 current_mode = (await response.json())['data']
 
@@ -176,7 +186,7 @@ class Sigen:
     async def fetch_operational_modes(self):
         await self.ensure_valid_token()
         url = f"{self.BASE_URL}device/sigen/station/operational/mode/v/{self.station_id}"
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers) as response:
                 self.operational_modes = (await response.json())['data']
 
@@ -187,7 +197,7 @@ class Sigen:
             'stationId': self.station_id,
             'operationMode': mode
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.put(url, headers=self.headers, json=payload) as response:
                 return await response.json()
 
@@ -203,7 +213,7 @@ class Sigen:
             'stationId': self.station_id,
             'current': amps
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.put(url, headers=self.headers, params=params) as response:
                 return await response.json()
 
@@ -227,7 +237,7 @@ class Sigen:
         params = {
             'stationId': self.station_id,
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers, params=params) as response:
                 json_response = await response.json()
                 self.ac_ev_last_set_current = json_response['data']['lastSetCurrent']
@@ -257,7 +267,7 @@ class Sigen:
             'phaseAutoSwitch': None,
             'offGridCharge': None,
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.post(url, headers=self.headers, json=payload) as response:
                 return await response.json()
 
@@ -282,7 +292,7 @@ class Sigen:
             'stationId': self.station_id,
             'snCode': self.ac_sn,
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.get(url, headers=self.headers, params=params) as response:
                 json_response = await response.json()  # Get the full JSON response
                 return json_response['data']
@@ -300,7 +310,7 @@ class Sigen:
             "encryption": encrypted_payload
         }
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             async with session.post(url, headers=self.headers, json=payload) as response:
                 if response.status == 200:
                     response_json = await response.json()

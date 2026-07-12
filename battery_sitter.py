@@ -11,6 +11,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
+from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 import signal
@@ -18,7 +19,12 @@ import signal
 from aiohttp import ClientResponseError, ClientSession
 from pymyenergi.connection import Connection
 from pymyenergi.zappi import Zappi
-from sigen import Sigen
+
+# Prefer the vendored sigen over any pip-installed copy: upstream is
+# unmaintained, so fixes (e.g. the CloudFront WAF user-agent workaround)
+# live in vendor/ and must win over site-packages.
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'vendor'))
+from sigen import Sigen, BROWSER_HEADERS
 
 
 class BatterySitter:
@@ -285,7 +291,7 @@ class BatterySitter:
             }
 
             if not self.http_session or self.http_session.closed:
-                self.http_session = ClientSession()
+                self.http_session = ClientSession(headers=BROWSER_HEADERS)
 
             async with self.http_session.put(
                 url, headers=self.sigen.headers, json=payload
