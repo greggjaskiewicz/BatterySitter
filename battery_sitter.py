@@ -8,12 +8,13 @@ power is used for EV charging instead of depleting the home battery.
 """
 
 import asyncio
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import signal
 
 from aiohttp import ClientResponseError, ClientSession
@@ -45,6 +46,15 @@ class BatterySitter:
         charging_duration_minutes: int = 30,
         # Polling settings
         poll_interval: int = 30,
+        # Solar-diversion guard: battery discharge (kW) considered "funding
+        # the car", and how many consecutive polls it must persist before we
+        # pin the battery and let the Zappi see the real grid deficit.
+        diversion_max_discharge_kw: float = 1.0,
+        diversion_sustained_polls: int = 4,
+        # Timed-charge schedule: JSON file of UTC windows during which the
+        # battery is force-charged (or blocked from charging), regardless
+        # of what the Zappi is doing. Reloaded whenever the file changes.
+        schedule_file: str = 'schedule.json',
     ):
         """
         Initialize BatterySitter
@@ -58,6 +68,11 @@ class BatterySitter:
             sigenergy_region: Region code (eu, us, cn, apac)
             charging_duration_minutes: Duration for manual charge when EV charging (minutes)
             poll_interval: Seconds between status checks
+            diversion_max_discharge_kw: During solar diversion, battery
+                discharge above this (kW) counts as draining into the car
+            diversion_sustained_polls: Consecutive polls of such discharge
+                before the guard trips (must outlast brief cloud gaps)
+            schedule_file: Path to the timed-charge schedule JSON file
         """
         self.zappi_username = zappi_username
         self.zappi_password = zappi_password
@@ -78,6 +93,39 @@ class BatterySitter:
         self.is_charging = False
         self.running = False
         self.manual_charge_enabled = False  # Track if WE enabled manual charge
+        self.manual_charge_enabled_at: Optional[datetime] = None
+        self.ev_stop_first_seen: Optional[datetime] = None
+        self.zappi_solar_diverting = False  # Zappi charging from excess solar
+        # Session-level diversion classification (Zappi flag + solar sanity)
+        self.in_diversion = False
+        self._diversion_reject_logged = False
+        self.diversion_max_discharge_kw = diversion_max_discharge_kw
+        self.diversion_sustained_polls = diversion_sustained_polls
+        # Guard against the battery silently funding the car in Eco+: battery
+        # discharge keeps the grid CT at zero, so the Zappi never sees the
+        # deficit and never pauses. Once tripped, the session is treated as
+        # needing normal battery protection until EV charging stops.
+        self.diversion_guard_active = False
+        self.diversion_discharge_polls = 0
+        # Timed-charge schedule state
+        self.schedule_file = Path(schedule_file)
+        self._schedule_mtime: Optional[float] = None
+        self._schedule_entries: list = []
+        self.schedule_charge_active = False
+        self.schedule_block_active = False
+        self.manual_charge_last_duration: Optional[int] = None
+        # Post-disable watchdog: Sigenergy has acknowledged a disable
+        # (HTTP 200) that the inverter never applied, leaving the battery
+        # charging from the grid unwatched (2026-10-04 incident). After a
+        # disable, verify for a few minutes that charging actually stopped.
+        self.disable_verify_until: Optional[datetime] = None
+        self.disable_verify_from: Optional[datetime] = None
+        self.disable_retries = 0
+        # Stall detection for timed windows: consecutive polls where the
+        # battery should be charging but isn't (popped breaker, ignored
+        # enable). Without this a dead battery wastes the whole window
+        # silently (2026-10-04 fuse incident).
+        self.window_stall_polls = 0
         self.last_connection_time: Optional[datetime] = None
         self.reconnect_interval = timedelta(hours=8)  # Reconnect every 8 hours
 
@@ -135,12 +183,29 @@ class BatterySitter:
             self.logger.error(f"Reconnect failed: {exc}", exc_info=True)
             raise
 
-    async def get_zappi_charging_status(self) -> bool:
+    def _manual_charge_expiring(self) -> bool:
+        """
+        True when the manual charge window is about to lapse. Refreshing it
+        just before expiry avoids the gap where the battery reverts to
+        self-powered mode and dumps several kW into the car until the next
+        poll notices.
+        """
+        if not self.manual_charge_enabled_at:
+            return False
+        elapsed = datetime.now() - self.manual_charge_enabled_at
+        margin = timedelta(seconds=2 * self.poll_interval)
+        duration = (self.manual_charge_last_duration
+                    or self.charging_duration_minutes)
+        return elapsed >= timedelta(minutes=duration) - margin
+
+    async def get_zappi_charging_status(self) -> Optional[bool]:
         """
         Check if Zappi is currently charging
 
         Returns:
-            True if charging is active, False otherwise
+            True if charging is active, False if not, None if the status
+            could not be read (caller should hold its previous state rather
+            than treat this as a session end)
         """
         try:
             await self.zappi.refresh()
@@ -154,6 +219,17 @@ class BatterySitter:
                 self.zappi.plug_status == 'Charging'
             )
 
+            # Solar diversion: Eco/Eco+ actively 'Charging' (not 'Boosting').
+            # Octopus-driven sessions come through as boosts, so this only
+            # matches genuine surplus-solar charging - where the battery must
+            # stay free to discharge and smooth short cloud gaps instead of
+            # being locked into a forced charge.
+            self.zappi_solar_diverting = (
+                is_charging and
+                self.zappi.status == 'Charging' and
+                self.zappi.charge_mode in ('Eco', 'Eco+')
+            )
+
             self.logger.debug(
                 f"Zappi status: {self.zappi.status}, "
                 f"plug_status: {self.zappi.plug_status}, "
@@ -163,8 +239,13 @@ class BatterySitter:
             return is_charging
 
         except Exception as e:
-            self.logger.error(f"Error reading Zappi status: {e}")
-            return False
+            # Unknown, not "stopped": leave zappi_solar_diverting as it was
+            # and let the caller hold its previous state - faking a session
+            # end here would release the battery lock mid-charge.
+            self.logger.error(
+                f"Error reading Zappi status: {type(e).__name__}: {e}"
+            )
+            return None
 
     async def get_battery_info(self) -> dict:
         """
@@ -173,36 +254,54 @@ class BatterySitter:
         Returns:
             Dictionary with energy flow data
         """
-        attempts = 3
+        # Sigenergy's cloud blips roughly every 5 minutes (502/503 for up to
+        # ~1 min), so the retry schedule must outlast a whole blip: attempts
+        # at t=0, 5, 20 and 50 seconds. Individual failed attempts are DEBUG;
+        # only exhausting all retries is worth an ERROR line.
+        attempts = 4
+        backoff = (5, 15, 30)
         for attempt in range(1, attempts + 1):
             try:
                 energy_flow = await self.sigen.get_energy_flow()
-                # Handle case where API returns None instead of raising exception
-                if energy_flow is None:
-                    self.logger.warning("get_energy_flow() returned None")
+                # Degraded Sigenergy responses come back as HTTP 200 with
+                # 'data' set to None or an error *string* - anything but a
+                # dict means no usable data.
+                if not isinstance(energy_flow, dict):
+                    self.logger.warning(
+                        "get_energy_flow() returned %s instead of dict: %.120r",
+                        type(energy_flow).__name__, energy_flow,
+                    )
                     return {}
                 return energy_flow
             except ClientResponseError as e:
                 # Transient cloud errors (502/503/504, non-JSON error pages).
                 # e.status / e.message / e.headers carry the useful detail.
+                if e.status in (502, 503, 504) and attempt < attempts:
+                    self.logger.debug(
+                        "Transient battery info error (attempt %d/%d): "
+                        "status=%s", attempt, attempts, e.status,
+                    )
+                    await asyncio.sleep(backoff[attempt - 1])
+                    continue
                 self.logger.error(
-                    "Error reading battery info (attempt %d/%d): "
+                    "Battery info unavailable (attempt %d/%d): "
                     "status=%s message=%r url=%s content-type=%s",
                     attempt, attempts, e.status, e.message, e.request_info.url,
                     e.headers.get("Content-Type") if e.headers else None,
                 )
-                if e.status in (502, 503, 504) and attempt < attempts:
-                    await asyncio.sleep(2 * attempt)
-                    continue
                 return {}
             except Exception as e:
+                if attempt < attempts:
+                    self.logger.debug(
+                        "Transient battery info error (attempt %d/%d): %s: %s",
+                        attempt, attempts, type(e).__name__, e,
+                    )
+                    await asyncio.sleep(backoff[attempt - 1])
+                    continue
                 self.logger.error(
-                    "Error reading battery info (attempt %d/%d): %s: %s",
+                    "Battery info unavailable (attempt %d/%d): %s: %s",
                     attempt, attempts, type(e).__name__, e,
                 )
-                if attempt < attempts:
-                    await asyncio.sleep(2 * attempt)
-                    continue
                 return {}
         return {}
 
@@ -299,19 +398,320 @@ class BatterySitter:
                 response.raise_for_status()
                 result = await response.json()
 
+                # Sigenergy signals failure inside an HTTP 200: the JSON
+                # body carries a non-zero 'code'. Trusting the status line
+                # alone once logged a successful disable that the inverter
+                # never applied (it kept charging until manually stopped).
+                code = result.get('code') if isinstance(result, dict) else None
+                if code not in (0, None):
+                    raise RuntimeError(
+                        f"Sigenergy rejected instant manual charge command "
+                        f"(enable={enable}): {str(result)[:200]}"
+                    )
+
                 if enable:
+                    self.manual_charge_enabled_at = datetime.now()
+                    self.manual_charge_last_duration = duration_minutes
+                    self.disable_verify_until = None
+                    self.disable_retries = 0
                     self.logger.info(
                         f"Enabled instant manual charge: "
                         f"{power_kw}kW for {duration_minutes} minutes"
                     )
                 else:
                     self.logger.info("Disabled instant manual charge")
+                    # Watch the next few polls to confirm the inverter
+                    # actually stopped charging. Start checking one poll
+                    # later: this poll's power reading predates the
+                    # disable, and the inverter needs ~30s to ramp down,
+                    # so checking immediately cries wolf (2026-10-04).
+                    self.disable_verify_until = (
+                        datetime.now() + timedelta(minutes=5)
+                    )
+                    self.disable_verify_from = (
+                        datetime.now()
+                        + timedelta(seconds=self.poll_interval + 5)
+                    )
 
                 return result
 
         except Exception as e:
             self.logger.error(f"Error setting instant manual charge: {e}")
             raise
+
+    def _load_schedule(self) -> list:
+        """
+        Load the timed-charge schedule, re-reading the file whenever its
+        mtime changes so entries can be added or removed while the service
+        runs (just scp a new schedule.json over - no restart needed).
+
+        The file is a JSON list; each entry:
+            {"start": "2026-09-06T13:00:00Z",   # UTC (naive = UTC)
+             "duration_minutes": 60,
+             "action": "charge",                 # or "block" (default charge)
+             "power_kw": 10.0,                   # optional, default config
+             "note": "free electricity hour"}    # optional, logged
+        Invalid entries are skipped individually so one typo can't take out
+        the whole schedule.
+        """
+        try:
+            mtime = self.schedule_file.stat().st_mtime
+        except OSError:
+            # No schedule file - the feature is simply inactive
+            if self._schedule_mtime is not None:
+                self.logger.info(
+                    f"Schedule file {self.schedule_file} removed"
+                )
+            self._schedule_mtime = None
+            self._schedule_entries = []
+            return self._schedule_entries
+
+        if mtime == self._schedule_mtime:
+            return self._schedule_entries
+
+        self._schedule_mtime = mtime
+        self._schedule_entries = []
+        try:
+            raw = json.loads(self.schedule_file.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as e:
+            self.logger.error(
+                f"Schedule file {self.schedule_file} unreadable: {e}"
+            )
+            return self._schedule_entries
+        if not isinstance(raw, list):
+            self.logger.error(
+                f"Schedule file {self.schedule_file} must contain a JSON "
+                f"list, got {type(raw).__name__}"
+            )
+            return self._schedule_entries
+
+        entries = []
+        for idx, item in enumerate(raw):
+            try:
+                start = datetime.fromisoformat(
+                    str(item['start']).replace('Z', '+00:00'))
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                duration = float(item['duration_minutes'])
+                if duration <= 0:
+                    raise ValueError("duration_minutes must be positive")
+                action = str(item.get('action', 'charge')).lower()
+                if action not in ('charge', 'block'):
+                    raise ValueError(f"unknown action {action!r}")
+                power_kw = item.get('power_kw')
+                if power_kw is not None:
+                    power_kw = float(power_kw)
+                    if power_kw <= 0:
+                        raise ValueError("power_kw must be positive")
+                entries.append({
+                    'start': start.astimezone(timezone.utc),
+                    'end': start + timedelta(minutes=duration),
+                    'action': action,
+                    'power_kw': power_kw,
+                    'note': item.get('note'),
+                })
+            except (KeyError, TypeError, ValueError) as e:
+                self.logger.error(
+                    f"Schedule entry {idx} in {self.schedule_file} "
+                    f"invalid, skipping: {e}"
+                )
+
+        self._schedule_entries = entries
+        now = datetime.now(timezone.utc)
+        upcoming = [e for e in entries if e['end'] > now]
+        self.logger.info(
+            f"Schedule loaded: {len(entries)} entries, "
+            f"{len(upcoming)} current/upcoming"
+        )
+        for e in upcoming:
+            power = e['power_kw'] if e['power_kw'] is not None \
+                else self.charging_power
+            detail = f" at {power}kW" if e['action'] == 'charge' else ""
+            note = f" - {e['note']}" if e['note'] else ""
+            self.logger.info(
+                f"  {e['action']} {e['start']:%Y-%m-%d %H:%M} to "
+                f"{e['end']:%H:%M} UTC{detail}{note}"
+            )
+        return entries
+
+    def _active_schedule_entry(self) -> Optional[dict]:
+        """The schedule entry whose window covers now, if any."""
+        now = datetime.now(timezone.utc)
+        for entry in self._load_schedule():
+            if entry['start'] <= now < entry['end']:
+                return entry
+        return None
+
+    async def _handle_schedule_window(
+        self, zappi_charging: bool, battery_soc, battery_power
+    ) -> bool:
+        """
+        Apply the timed-charge schedule. Returns True when a window is
+        active and owns this poll (the normal EV state machine is skipped);
+        False otherwise. A window that has just ended is cleaned up here
+        before handing control back to the state machine.
+        """
+        entry = self._active_schedule_entry()
+
+        if entry is None:
+            if self.schedule_charge_active:
+                self.schedule_charge_active = False
+                if zappi_charging and not self.in_diversion:
+                    # EV still drawing power: keep the pin and let the EV
+                    # protection maintain it, instead of opening a gap where
+                    # the battery dumps into the car.
+                    self.logger.info(
+                        "⏰ Timed charge window ended - EV still charging, "
+                        "handing battery pin over to EV protection"
+                    )
+                    self.is_charging = True
+                else:
+                    self.logger.info(
+                        f"⏰ Timed charge window ended (SOC: {battery_soc}%)"
+                        " - disabling instant manual charge"
+                    )
+                    if self.manual_charge_enabled:
+                        await self.set_instant_manual_charge(
+                            enable=False, duration_minutes=0, power_kw=0
+                        )
+                        self.manual_charge_enabled = False
+            if self.schedule_block_active:
+                self.schedule_block_active = False
+                self.logger.info(
+                    "⏰ Timed block window ended - normal operation resumes"
+                )
+            return False
+
+        now = datetime.now(timezone.utc)
+        note = f" ({entry['note']})" if entry['note'] else ""
+
+        if entry['action'] == 'charge':
+            self.schedule_block_active = False
+            # Cap the requested duration at the window's end, so even if
+            # this process dies mid-window Sigenergy stops on time.
+            remaining_min = (entry['end'] - now).total_seconds() / 60
+            duration = max(1, min(self.charging_duration_minutes,
+                                  int(remaining_min) + 1))
+            power = entry['power_kw'] if entry['power_kw'] is not None \
+                else self.charging_power
+            if not self.schedule_charge_active:
+                self.logger.info(
+                    f"⏰ Timed charge window started{note} - charging at "
+                    f"{power}kW until {entry['end']:%H:%M} UTC "
+                    f"(SOC: {battery_soc}%, Power: {battery_power}kW)"
+                )
+                await self.set_instant_manual_charge(
+                    enable=True, duration_minutes=duration, power_kw=power
+                )
+                self.schedule_charge_active = True
+                self.manual_charge_enabled = True
+                self.window_stall_polls = 0
+            else:
+                if self._manual_charge_expiring():
+                    self.logger.info(
+                        f"Timed charge window - refreshing "
+                        f"({power}kW for {duration}min)"
+                    )
+                    await self.set_instant_manual_charge(
+                        enable=True, duration_minutes=duration,
+                        power_kw=power
+                    )
+
+                # Stall detection: mid-window, a healthy battery below
+                # full should be visibly charging. A popped breaker or a
+                # silently ignored enable otherwise wastes the whole
+                # window with nothing in the log.
+                power_known = isinstance(battery_power, (int, float))
+                soc_known = isinstance(battery_soc, (int, float))
+                if (power_known and battery_power < 0.5
+                        and (not soc_known or battery_soc < 99.0)):
+                    self.window_stall_polls += 1
+                    if self.window_stall_polls == 3:
+                        # Pin on but no power = likely breaker; pin off =
+                        # dropped enable, worth re-sending.
+                        state = await self.get_instant_manual_charge()
+                        if state is not None and state.get('enable'):
+                            self.logger.error(
+                                f"Timed charge pin is active but battery "
+                                f"takes no power (Power: {battery_power}kW, "
+                                f"SOC: {battery_soc}%) - battery may be "
+                                f"offline (breaker tripped?)"
+                            )
+                            self.window_stall_polls = 6  # skip re-enable
+                        else:
+                            self.logger.warning(
+                                f"Timed charge window active but battery "
+                                f"not charging (Power: {battery_power}kW, "
+                                f"SOC: {battery_soc}%) - re-sending enable"
+                            )
+                            await self.set_instant_manual_charge(
+                                enable=True, duration_minutes=duration,
+                                power_kw=power
+                            )
+                    elif self.window_stall_polls == 6:
+                        self.logger.error(
+                            f"Timed charge still not charging after "
+                            f"re-enable (Power: {battery_power}kW, SOC: "
+                            f"{battery_soc}%) - battery may be offline "
+                            f"(breaker tripped?)"
+                        )
+                elif power_known:
+                    self.window_stall_polls = 0
+        else:  # 'block'
+            if self.schedule_charge_active:
+                self.schedule_charge_active = False
+            if not self.schedule_block_active:
+                self.logger.info(
+                    f"⏰ Timed block window started{note} - suppressing "
+                    f"battery charging until {entry['end']:%H:%M} UTC"
+                )
+                self.schedule_block_active = True
+            if self.manual_charge_enabled:
+                self.logger.info(
+                    "Timed block window - disabling instant manual charge"
+                )
+                await self.set_instant_manual_charge(
+                    enable=False, duration_minutes=0, power_kw=0
+                )
+                self.manual_charge_enabled = False
+
+        # Keep the Zappi tracking in sync so the state machine sees no fake
+        # start/stop transition when the window ends.
+        self.is_charging = zappi_charging
+        self.ev_stop_first_seen = None
+        return True
+
+    async def get_instant_manual_charge(self) -> Optional[dict]:
+        """
+        Read the authoritative instant-manual-charge state (enable flag,
+        mode, end time) from Sigenergy. Lets the watchdogs check whether
+        the pin is actually on/off instead of inferring it from power
+        flows. Returns None when the read fails - callers must fall back
+        to their heuristic in that case.
+        """
+        try:
+            await self.sigen.ensure_valid_token()
+            url = (f"{self.sigen.BASE_URL}device/energy-profile/"
+                   f"instant/manunal/{self.sigen.station_id}")
+            if not self.http_session or self.http_session.closed:
+                self.http_session = ClientSession(headers=BROWSER_HEADERS)
+            async with self.http_session.get(
+                url, headers=self.sigen.headers
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+                if isinstance(result, dict) and result.get('code') == 0:
+                    return result.get('data')
+                self.logger.debug(
+                    f"Instant charge state read returned: {result}"
+                )
+                return None
+        except Exception as e:
+            self.logger.debug(
+                f"Could not read instant charge state: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
 
     async def monitor_loop(self):
         """Main monitoring loop"""
@@ -323,6 +723,16 @@ class BatterySitter:
              f"Enable instant manual battery charge at "
              f"{self.charging_power}kW for {self.charging_duration_minutes}min"
         )
+        self.logger.info(
+             f"During solar diversion: battery left free; guard pins it after "
+             f"{self.diversion_sustained_polls} polls of discharge >= "
+             f"{self.diversion_max_discharge_kw}kW"
+        )
+        self.logger.info(
+            f"Timed-charge schedule file: {self.schedule_file} "
+            f"(UTC times, editable while running)"
+        )
+        self._load_schedule()
 
         consecutive_errors = 0
         while self.running:
@@ -335,8 +745,13 @@ class BatterySitter:
                         await self._reconnect(f"scheduled refresh after {hours:.1f} hours")
                         consecutive_errors = 0
 
-                # Check Zappi charging status
-                zappi_charging = await self.get_zappi_charging_status()
+                # Check Zappi charging status. On a failed read (None), hold
+                # the previous state - a myenergi blip must not look like a
+                # session end.
+                zappi_status = await self.get_zappi_charging_status()
+                zappi_charging = (
+                    self.is_charging if zappi_status is None else zappi_status
+                )
 
                 # Get battery/energy info for logging
                 battery_info = await self.get_battery_info()
@@ -379,15 +794,72 @@ class BatterySitter:
                 battery_already_charging = battery_power_known and battery_power > 0
                 battery_known_not_charging = battery_power_known and battery_power <= 0
 
+                # Any confirmed charging poll cancels a pending stop-debounce
+                if zappi_charging:
+                    self.ev_stop_first_seen = None
+
+                # Session-level diversion classification. The Zappi also
+                # reports plain 'Charging' in Eco+ while winding a session
+                # down at night, so *entering* diversion mode additionally
+                # requires actual solar production. Once in, brief cloud dips
+                # don't kick us out (that smoothing is the whole point) - the
+                # discharge guard is the backstop if the sun is gone for good.
+                solar_parts = [
+                    v for v in (battery_info.get('pvPower'),
+                                battery_info.get('thirdPvPower'))
+                    if isinstance(v, (int, float))
+                ] if battery_info else []
+                solar_kw = sum(solar_parts) if solar_parts else None
+                if self.zappi_solar_diverting:
+                    if not self.in_diversion:
+                        if solar_kw is None or solar_kw >= 0.5:
+                            self.in_diversion = True
+                            self._diversion_reject_logged = False
+                        elif not self._diversion_reject_logged:
+                            self.logger.info(
+                                f"Zappi reports Eco+ charging but solar is "
+                                f"only {solar_kw}kW - treating as grid "
+                                f"charge, keeping battery protection"
+                            )
+                            self._diversion_reject_logged = True
+                else:
+                    self.in_diversion = False
+                    self._diversion_reject_logged = False
+
+                # Timed-charge schedule outranks the EV state machine: a
+                # pre-programmed window (e.g. a free-electricity hour while
+                # away) charges or blocks regardless of what the Zappi does.
+                if await self._handle_schedule_window(
+                        zappi_charging, battery_soc, battery_power):
+                    consecutive_errors = 0
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
                 # Handle state changes
                 if zappi_charging and not self.is_charging:
                     # EV charging just started
                     self.logger.info(
                         f"⚡ EV charging detected! "
-                        f"Battery SOC: {battery_soc}%, Power: {battery_power}W"
+                        f"Battery SOC: {battery_soc}%, Power: {battery_power}kW, "
+                        f"Zappi: {self.zappi.status}/{self.zappi.charge_mode}"
                     )
 
-                    if battery_already_charging:
+                    self.diversion_guard_active = False
+                    self.diversion_discharge_polls = 0
+
+                    if self.in_diversion:
+                        # Excess-solar diversion: leave the battery completely
+                        # alone so it can discharge through brief cloud gaps
+                        # instead of turning them into grid imports. The guard
+                        # below steps in if that discharge turns sustained.
+                        self.logger.info(
+                            "Zappi is diverting excess solar (Eco/Eco+) - "
+                            "leaving battery untouched so it can smooth "
+                            "cloud gaps"
+                        )
+                        self.is_charging = True
+                        self.manual_charge_enabled = False
+                    elif battery_already_charging:
                         self.logger.info(
                             "Battery is already charging - "
                             "not overriding existing charge control"
@@ -421,38 +893,163 @@ class BatterySitter:
                         self.manual_charge_enabled = False
 
                 elif not zappi_charging and self.is_charging:
-                    # EV charging just stopped
-                    self.logger.info(
-                        f"🔌 EV charging stopped. "
-                        f"Battery SOC: {battery_soc}%, Power: {battery_power}W"
-                    )
-
-                    # Disable instant manual charge only if WE enabled it
-                    if self.manual_charge_enabled:
-                        self.logger.info("Disabling instant manual battery charge")
-                        await self.set_instant_manual_charge(
-                            enable=False, duration_minutes=0, power_kw=0
+                    # EV charging looks stopped - but Octopus runs its slots
+                    # back-to-back with ~30s gaps, and releasing the lock in a
+                    # gap lets the battery dump several kW into the car the
+                    # moment the next slot opens. Hold everything until the
+                    # stop has persisted long enough to be a real session end.
+                    if self.ev_stop_first_seen is None:
+                        self.ev_stop_first_seen = datetime.now()
+                        self.logger.info(
+                            f"EV charging paused (SOC: {battery_soc}%, "
+                            f"Power: {battery_power}kW) - holding battery lock "
+                            f"in case this is just a slot gap"
                         )
-                        self.manual_charge_enabled = False
+                    elif (datetime.now() - self.ev_stop_first_seen).total_seconds() \
+                            >= 3 * self.poll_interval:
+                        self.logger.info(
+                            f"🔌 EV charging stopped. "
+                            f"Battery SOC: {battery_soc}%, Power: {battery_power}kW"
+                        )
 
-                    self.is_charging = False
+                        # Disable instant manual charge only if WE enabled it
+                        if self.manual_charge_enabled:
+                            self.logger.info("Disabling instant manual battery charge")
+                            await self.set_instant_manual_charge(
+                                enable=False, duration_minutes=0, power_kw=0
+                            )
+                            self.manual_charge_enabled = False
+
+                        self.is_charging = False
+                        self.diversion_guard_active = False
+                        self.diversion_discharge_polls = 0
+                        self.in_diversion = False
+                        self.ev_stop_first_seen = None
 
                 elif zappi_charging and self.is_charging:
                     # EV charging continues
-                    if battery_already_charging:
-                        # Battery is charging (either from us or system AI/timer) - no action needed
-                        self.logger.debug(
-                            f"Status: charging EV, Battery charging "
-                            f"(SOC: {battery_soc}%, Power: {battery_power}W)"
-                        )
+                    if self.in_diversion and not self.diversion_guard_active:
+                        # Session is (or has become) solar diversion - the
+                        # battery must stay free. If we forced a charge earlier
+                        # (e.g. session started as an Octopus boost), release it.
+                        if self.manual_charge_enabled:
+                            self.logger.info(
+                                "Zappi switched to solar diversion - disabling "
+                                "instant manual charge to free the battery"
+                            )
+                            await self.set_instant_manual_charge(
+                                enable=False, duration_minutes=0, power_kw=0
+                            )
+                            self.manual_charge_enabled = False
+                            self.diversion_discharge_polls = 0
+                        else:
+                            # Guard: sustained heavy discharge means the sun is
+                            # gone for real and the battery is funding the car
+                            # (its discharge keeps the grid CT at zero, so the
+                            # Zappi never pauses on its own). Pin the battery;
+                            # the Zappi then sees genuine grid import and its
+                            # Eco+ logic stops the session.
+                            if battery_power_known and \
+                                    battery_power <= -self.diversion_max_discharge_kw:
+                                self.diversion_discharge_polls += 1
+                            elif battery_power_known:
+                                self.diversion_discharge_polls = 0
+                            # Unknown power: keep the count, decide when data returns
+
+                            if self.diversion_discharge_polls >= self.diversion_sustained_polls:
+                                self.logger.info(
+                                    f"Battery discharging "
+                                    f"{abs(battery_power)}kW for "
+                                    f"{self.diversion_discharge_polls} polls during "
+                                    f"solar diversion - solar can no longer cover "
+                                    f"the car. Pinning battery so the Zappi sees "
+                                    f"the grid deficit and pauses"
+                                )
+                                await self.set_instant_manual_charge(
+                                    enable=True,
+                                    duration_minutes=self.charging_duration_minutes,
+                                    power_kw=self.charging_power
+                                )
+                                self.manual_charge_enabled = True
+                                self.diversion_guard_active = True
+                                self.diversion_discharge_polls = 0
+                            else:
+                                self.logger.debug(
+                                    f"Status: solar diversion charging, battery "
+                                    f"left alone (SOC: {battery_soc}%, "
+                                    f"Power: {battery_power}kW, discharge polls: "
+                                    f"{self.diversion_discharge_polls}/"
+                                    f"{self.diversion_sustained_polls})"
+                                )
+                    elif battery_already_charging:
+                        if self.manual_charge_enabled and self._manual_charge_expiring():
+                            # Renew before the window lapses - reacting after
+                            # expiry leaks ~a poll's worth of heavy discharge
+                            # into the car.
+                            self.logger.info(
+                                f"Manual charge window closing - refreshing "
+                                f"({self.charging_power}kW for "
+                                f"{self.charging_duration_minutes}min)"
+                            )
+                            await self.set_instant_manual_charge(
+                                enable=True,
+                                duration_minutes=self.charging_duration_minutes,
+                                power_kw=self.charging_power
+                            )
+                        else:
+                            # Battery is charging (either from us or system
+                            # AI/timer) - no action needed
+                            self.logger.debug(
+                                f"Status: charging EV, Battery charging "
+                                f"(SOC: {battery_soc}%, Power: {battery_power}kW)"
+                            )
                     elif not battery_power_known:
                         # Power unknown (cloud/connection/schema issue) - skip the
                         # (re)enable this poll rather than acting on missing data.
-                        # Existing manual charge (if any) is left untouched.
-                        self.logger.debug(
-                            "Status: charging EV, battery power unknown - "
-                            "skipping manual-charge (re)enable this poll"
-                        )
+                        # The pre-expiry refresh still runs, though: it needs no
+                        # battery reading, and letting the window lapse during a
+                        # cloud blip drops the pin exactly while the discharge
+                        # is invisible to us.
+                        if self.manual_charge_enabled and \
+                                self._manual_charge_expiring():
+                            self.logger.info(
+                                f"Manual charge window closing (battery power "
+                                f"unknown) - refreshing ({self.charging_power}kW "
+                                f"for {self.charging_duration_minutes}min)"
+                            )
+                            await self.set_instant_manual_charge(
+                                enable=True,
+                                duration_minutes=self.charging_duration_minutes,
+                                power_kw=self.charging_power
+                            )
+                        else:
+                            self.logger.debug(
+                                "Status: charging EV, battery power unknown - "
+                                "skipping manual-charge (re)enable this poll"
+                            )
+                    elif self.manual_charge_enabled and \
+                            isinstance(battery_soc, (int, float)) and \
+                            battery_soc >= 99.0:
+                        # Full battery can't accept charge, so 0kW here is the
+                        # healthy pinned state - the manual charge is purely a
+                        # discharge-lock now. Only the pre-expiry refresh is
+                        # needed; re-enabling every poll would hammer the API.
+                        if self._manual_charge_expiring():
+                            self.logger.info(
+                                f"Manual charge window closing - refreshing "
+                                f"({self.charging_power}kW for "
+                                f"{self.charging_duration_minutes}min)"
+                            )
+                            await self.set_instant_manual_charge(
+                                enable=True,
+                                duration_minutes=self.charging_duration_minutes,
+                                power_kw=self.charging_power
+                            )
+                        else:
+                            self.logger.debug(
+                                f"Status: charging EV, battery full "
+                                f"(SOC: {battery_soc}%) - discharge-lock held"
+                            )
                     else:
                         # Battery is NOT charging - enable/re-enable manual charge
                         if not self.manual_charge_enabled:
@@ -463,11 +1060,11 @@ class BatterySitter:
                             )
                         else:
                             # Battery stopped charging even though we enabled it
-                            # (API failure, timer expired, or SOC at 100%)
+                            # (API failure or timer expired before the refresh)
                             # Re-enable to ensure it charges
                             self.logger.warning(
                                 f"Battery not charging despite manual charge "
-                                f"enabled (SOC: {battery_soc}%, Power: {battery_power}W) "
+                                f"enabled (SOC: {battery_soc}%, Power: {battery_power}kW) "
                                 f"- retrying enable"
                             )
 
@@ -480,7 +1077,52 @@ class BatterySitter:
                         self.manual_charge_enabled = True
 
                 else:
-                    # No state change - just log status periodically
+                    # No state change. First, the post-disable watchdog: if
+                    # we recently disabled the manual charge but the battery
+                    # is still pulling power, the inverter ignored the
+                    # disable - re-send it rather than leave an unwatched
+                    # grid charge running.
+                    if (self.disable_verify_until and battery_power_known
+                            and (self.disable_verify_from is None
+                                 or datetime.now()
+                                 >= self.disable_verify_from)):
+                        if datetime.now() >= self.disable_verify_until:
+                            self.disable_verify_until = None
+                            self.disable_retries = 0
+                        elif battery_power > 0.5:
+                            # Ask Sigenergy directly whether the pin is
+                            # really still on - charging power alone can
+                            # also be solar or the inverter's own plan.
+                            state = await self.get_instant_manual_charge()
+                            if state is not None and not state.get('enable'):
+                                self.logger.debug(
+                                    "Disable confirmed by API; charging "
+                                    "power is from another source"
+                                )
+                                self.disable_verify_until = None
+                                self.disable_retries = 0
+                            elif self.disable_retries < 3:
+                                self.disable_retries += 1
+                                self.logger.warning(
+                                    f"Battery still charging "
+                                    f"({battery_power}kW) after disable - "
+                                    f"re-sending disable (attempt "
+                                    f"{self.disable_retries}/3)"
+                                )
+                                await self.set_instant_manual_charge(
+                                    enable=False, duration_minutes=0,
+                                    power_kw=0
+                                )
+                            else:
+                                self.logger.error(
+                                    f"Battery still charging "
+                                    f"({battery_power}kW) after 3 disable "
+                                    f"retries - may need manual intervention"
+                                )
+                                self.disable_verify_until = None
+                                self.disable_retries = 0
+
+                    # Log status periodically
                     if isinstance(battery_power, (int, float)):
                         if battery_power > 0:
                             power_status = "charging"
@@ -490,7 +1132,7 @@ class BatterySitter:
                             power_status = "idle"
                         self.logger.debug(
                             f"Status: idle, Battery SOC: {battery_soc}%, "
-                            f"Battery {power_status}: {abs(battery_power)}W"
+                            f"Battery {power_status}: {abs(battery_power)}kW"
                         )
                     else:
                         self.logger.debug(

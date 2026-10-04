@@ -1,0 +1,15 @@
+[
+  {
+    "start": "2026-09-06T13:00:00Z",
+    "duration_minutes": 60,
+    "action": "charge",
+    "power_kw": 10.0,
+    "note": "free electricity hour (14:00 UK time)"
+  },
+  {
+    "start": "2026-12-25T17:00:00Z",
+    "duration_minutes": 120,
+    "action": "block",
+    "note": "peak pricing - do not force-charge the battery"
+  }
+]

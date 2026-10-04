@@ -13,5 +13,10 @@
   },
   "polling": {
     "interval_seconds": 30
-  }
+  },
+  "diversion_guard": {
+    "max_discharge_kw": 1.0,
+    "sustained_polls": 4
+  },
+  "schedule_file": "schedule.json"
 }

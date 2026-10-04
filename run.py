@@ -36,6 +36,7 @@ async def main():
     # Load configuration
     config = load_config()
     charge_duration = config['sigenergy'].get('charging_duration_minutes', 30)
+    diversion_guard = config.get('diversion_guard', {})
 
     # Configure logging
     rotating_handler = RotatingFileHandler(
@@ -80,7 +81,10 @@ async def main():
         sigenergy_region=config['sigenergy']['region'],
         poll_interval=config['polling']['interval_seconds'],
         charging_power=config['sigenergy']['charging_power'],
-        charging_duration_minutes=charge_duration
+        charging_duration_minutes=charge_duration,
+        diversion_max_discharge_kw=diversion_guard.get('max_discharge_kw', 1.0),
+        diversion_sustained_polls=diversion_guard.get('sustained_polls', 4),
+        schedule_file=config.get('schedule_file', 'schedule.json')
     )
 
     # Run the service
