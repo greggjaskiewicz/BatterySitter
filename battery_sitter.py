@@ -46,11 +46,6 @@ class BatterySitter:
         charging_duration_minutes: int = 30,
         # Polling settings
         poll_interval: int = 30,
-        # Solar-diversion guard: battery discharge (kW) considered "funding
-        # the car", and how many consecutive polls it must persist before we
-        # pin the battery and let the Zappi see the real grid deficit.
-        diversion_max_discharge_kw: float = 1.0,
-        diversion_sustained_polls: int = 4,
         # Timed-charge schedule: JSON file of UTC windows during which the
         # battery is force-charged (or blocked from charging), regardless
         # of what the Zappi is doing. Reloaded whenever the file changes.
@@ -68,10 +63,6 @@ class BatterySitter:
             sigenergy_region: Region code (eu, us, cn, apac)
             charging_duration_minutes: Duration for manual charge when EV charging (minutes)
             poll_interval: Seconds between status checks
-            diversion_max_discharge_kw: During solar diversion, battery
-                discharge above this (kW) counts as draining into the car
-            diversion_sustained_polls: Consecutive polls of such discharge
-                before the guard trips (must outlast brief cloud gaps)
             schedule_file: Path to the timed-charge schedule JSON file
         """
         self.zappi_username = zappi_username
@@ -96,17 +87,15 @@ class BatterySitter:
         self.manual_charge_enabled_at: Optional[datetime] = None
         self.ev_stop_first_seen: Optional[datetime] = None
         self.zappi_solar_diverting = False  # Zappi charging from excess solar
+        self.zappi_manual_boost = False  # Low-speed boost: leave battery alone
+        self.zappi_ev_power_kw: Optional[float] = None
+        # A boost with the car drawing below this (kW) is a manual/slow boost
+        # (leave the battery alone); at or above it we treat it as an
+        # Octopus-driven fast charge and protect/charge the battery as before.
+        self.manual_boost_max_kw = 4.0
         # Session-level diversion classification (Zappi flag + solar sanity)
         self.in_diversion = False
         self._diversion_reject_logged = False
-        self.diversion_max_discharge_kw = diversion_max_discharge_kw
-        self.diversion_sustained_polls = diversion_sustained_polls
-        # Guard against the battery silently funding the car in Eco+: battery
-        # discharge keeps the grid CT at zero, so the Zappi never sees the
-        # deficit and never pauses. Once tripped, the session is treated as
-        # needing normal battery protection until EV charging stops.
-        self.diversion_guard_active = False
-        self.diversion_discharge_polls = 0
         # Timed-charge schedule state
         self.schedule_file = Path(schedule_file)
         self._schedule_mtime: Optional[float] = None
@@ -198,6 +187,49 @@ class BatterySitter:
                     or self.charging_duration_minutes)
         return elapsed >= timedelta(minutes=duration) - margin
 
+    async def _release_pin_if_active(self) -> bool:
+        """
+        Ensure the instant-manual-charge pin is OFF. Used during a manual/slow
+        boost, where we must never force-charge the battery. Reads the
+        authoritative pin state so it also catches a pin left over from before
+        a restart (when manual_charge_enabled is False but the inverter still
+        has one running). Only issues the disable when the pin is actually on,
+        so it does not hammer the API. Returns True if it disabled a pin.
+        """
+        state = await self.get_instant_manual_charge()
+        pin_on = state.get('enable') if isinstance(state, dict) else None
+        if pin_on or (pin_on is None and self.manual_charge_enabled):
+            self.logger.info(
+                "Clearing instant manual charge during manual/slow boost"
+            )
+            await self.set_instant_manual_charge(
+                enable=False, duration_minutes=0, power_kw=0
+            )
+            self.manual_charge_enabled = False
+            return True
+        self.manual_charge_enabled = False
+        return False
+
+    def _zappi_ev_power_kw(self) -> Optional[float]:
+        """
+        Car charge power in kW, from the Zappi's 'Internal Load' CT clamp(s).
+        This is the actual power going into the EV - the 'speed' that tells a
+        slow manual boost apart from an Octopus-driven fast charge. Returns
+        None if the clamp data isn't available (caller must not assume slow).
+        """
+        data = getattr(self.zappi, '_data', None)
+        if not isinstance(data, dict):
+            return None
+        total_w = 0.0
+        found = False
+        for i in range(1, 7):
+            if data.get(f'ectt{i}') == 'Internal Load':
+                p = data.get(f'ectp{i}')
+                if isinstance(p, (int, float)):
+                    total_w += p
+                    found = True
+        return (total_w / 1000.0) if found else None
+
     async def get_zappi_charging_status(self) -> Optional[bool]:
         """
         Check if Zappi is currently charging
@@ -230,11 +262,35 @@ class BatterySitter:
                 self.zappi.charge_mode in ('Eco', 'Eco+')
             )
 
+            # Manual vs Octopus boost is distinguished by SPEED, not mode:
+            # both log as Boosting/Eco+, but Octopus drives the car at the
+            # full rate (>= threshold) while a user's manual/slow boost sits
+            # below it. We read the car's actual draw from the Zappi's
+            # 'Internal Load' CT. Below the threshold we must NOT force-charge
+            # the home battery (the user is boosting the car, not the house).
+            # When the EV power can't be read we treat it as NOT manual, so
+            # Octopus drain-protection is never lost on a missing reading.
+            ev_kw = self._zappi_ev_power_kw()
+            self.zappi_ev_power_kw = ev_kw
+            self.zappi_manual_boost = (
+                is_charging
+                and ev_kw is not None
+                and ev_kw < self.manual_boost_max_kw
+            )
+
             self.logger.debug(
                 f"Zappi status: {self.zappi.status}, "
                 f"plug_status: {self.zappi.plug_status}, "
-                f"charge_mode: {self.zappi.charge_mode}"
+                f"charge_mode: {self.zappi.charge_mode}, "
+                f"ev_power: {ev_kw}kW, bsm: {self.zappi.bsm}"
             )
+            if is_charging and not self.is_charging:
+                self.logger.info(
+                    f"Zappi boost fingerprint - status: "
+                    f"{self.zappi.status}, mode: {self.zappi.charge_mode}, "
+                    f"ev_power: {ev_kw}kW, bsm: {self.zappi.bsm} "
+                    f"({'manual/slow' if self.zappi_manual_boost else 'fast/Octopus'})"
+                )
 
             return is_charging
 
@@ -724,15 +780,41 @@ class BatterySitter:
              f"{self.charging_power}kW for {self.charging_duration_minutes}min"
         )
         self.logger.info(
-             f"During solar diversion: battery left free; guard pins it after "
-             f"{self.diversion_sustained_polls} polls of discharge >= "
-             f"{self.diversion_max_discharge_kw}kW"
+             "During solar diversion: battery left free to feed the car "
+             "(no grid-charging; inverter backup reserve is the floor)"
+        )
+        self.logger.info(
+             f"Manual/slow boost (car < {self.manual_boost_max_kw}kW): "
+             f"battery left alone, no forced charge"
         )
         self.logger.info(
             f"Timed-charge schedule file: {self.schedule_file} "
             f"(UTC times, editable while running)"
         )
         self._load_schedule()
+
+        # Startup reconciliation: clear any instant-manual-charge pin left
+        # running on the inverter from before this process started. We can't
+        # tell whose it was, and a stale pin keeps grid-charging the battery
+        # for its whole duration with nothing owning it (e.g. a 30-min pin
+        # surviving a restart). The loop re-establishes a pin within one poll
+        # if the current state genuinely wants one (Octopus boost or a timed
+        # charge window), so a clean slate here is safe.
+        try:
+            state = await self.get_instant_manual_charge()
+            if isinstance(state, dict) and state.get('enable'):
+                self.logger.info(
+                    "Startup: clearing a pre-existing instant manual "
+                    "charge pin (will re-establish if still needed)"
+                )
+                await self.set_instant_manual_charge(
+                    enable=False, duration_minutes=0, power_kw=0
+                )
+            self.manual_charge_enabled = False
+        except Exception as e:
+            self.logger.warning(
+                f"Startup pin reconciliation failed: {type(e).__name__}: {e}"
+            )
 
         consecutive_errors = 0
         while self.running:
@@ -844,17 +926,30 @@ class BatterySitter:
                         f"Zappi: {self.zappi.status}/{self.zappi.charge_mode}"
                     )
 
-                    self.diversion_guard_active = False
-                    self.diversion_discharge_polls = 0
-
-                    if self.in_diversion:
+                    if self.zappi_manual_boost:
+                        # Manual/slow boost (car below the Octopus-rate
+                        # threshold): a deliberate low-power charge the user is
+                        # managing themselves. Do NOT force-charge the home
+                        # battery on top of it, and clear any pin that may be
+                        # active (including one left over from before a
+                        # restart, which we otherwise wouldn't know about).
+                        self.logger.info(
+                            f"Zappi manual/slow boost "
+                            f"(car {self.zappi_ev_power_kw}kW) - leaving "
+                            f"battery alone (no forced charge)"
+                        )
+                        await self._release_pin_if_active()
+                        self.is_charging = True
+                    elif self.in_diversion:
                         # Excess-solar diversion: leave the battery completely
-                        # alone so it can discharge through brief cloud gaps
-                        # instead of turning them into grid imports. The guard
-                        # below steps in if that discharge turns sustained.
+                        # alone. It may feed the car directly - that is wanted,
+                        # since battery beats grid during a solar session - and
+                        # it can also smooth brief cloud gaps. We never grid-
+                        # charge the battery here; the inverter's backup reserve
+                        # is the floor that stops it draining too far.
                         self.logger.info(
                             "Zappi is diverting excess solar (Eco/Eco+) - "
-                            "leaving battery untouched so it can smooth "
+                            "leaving battery free to feed the car / smooth "
                             "cloud gaps"
                         )
                         self.is_charging = True
@@ -921,18 +1016,37 @@ class BatterySitter:
                             self.manual_charge_enabled = False
 
                         self.is_charging = False
-                        self.diversion_guard_active = False
-                        self.diversion_discharge_polls = 0
                         self.in_diversion = False
                         self.ev_stop_first_seen = None
 
                 elif zappi_charging and self.is_charging:
                     # EV charging continues
-                    if self.in_diversion and not self.diversion_guard_active:
-                        # Session is (or has become) solar diversion - the
-                        # battery must stay free. If we forced a charge earlier
-                        # (e.g. session started as an Octopus boost), release it.
+                    if self.zappi_manual_boost:
+                        # Still a manual/slow boost: keep the battery free and
+                        # make sure no pin is active (covers one set earlier in
+                        # the session, or a lingering one from before a
+                        # restart). _release_pin_if_active only hits the API
+                        # when the pin is actually on, so this won't hammer it.
+                        released = await self._release_pin_if_active()
+                        if not released:
+                            self.logger.debug(
+                                f"Status: manual/slow boost "
+                                f"(car {self.zappi_ev_power_kw}kW), battery "
+                                f"left alone (SOC: {battery_soc}%, "
+                                f"Power: {battery_power}kW)"
+                            )
+                    elif self.in_diversion:
+                        # Solar diversion (Eco/Eco+): the battery stays free
+                        # throughout. Feeding the car from the battery during
+                        # a solar session is wanted - it beats importing grid,
+                        # and the inverter's own backup reserve (backupSOC) is
+                        # the floor that stops the battery draining too far.
+                        # We never grid-charge the battery here; grid import is
+                        # only acceptable for a 5kW+ Octopus boost, which comes
+                        # through as a 'Boosting' session, not diversion.
                         if self.manual_charge_enabled:
+                            # A pin left over from an earlier boost leg of this
+                            # session - release it so the battery can discharge.
                             self.logger.info(
                                 "Zappi switched to solar diversion - disabling "
                                 "instant manual charge to free the battery"
@@ -941,46 +1055,12 @@ class BatterySitter:
                                 enable=False, duration_minutes=0, power_kw=0
                             )
                             self.manual_charge_enabled = False
-                            self.diversion_discharge_polls = 0
                         else:
-                            # Guard: sustained heavy discharge means the sun is
-                            # gone for real and the battery is funding the car
-                            # (its discharge keeps the grid CT at zero, so the
-                            # Zappi never pauses on its own). Pin the battery;
-                            # the Zappi then sees genuine grid import and its
-                            # Eco+ logic stops the session.
-                            if battery_power_known and \
-                                    battery_power <= -self.diversion_max_discharge_kw:
-                                self.diversion_discharge_polls += 1
-                            elif battery_power_known:
-                                self.diversion_discharge_polls = 0
-                            # Unknown power: keep the count, decide when data returns
-
-                            if self.diversion_discharge_polls >= self.diversion_sustained_polls:
-                                self.logger.info(
-                                    f"Battery discharging "
-                                    f"{abs(battery_power)}kW for "
-                                    f"{self.diversion_discharge_polls} polls during "
-                                    f"solar diversion - solar can no longer cover "
-                                    f"the car. Pinning battery so the Zappi sees "
-                                    f"the grid deficit and pauses"
-                                )
-                                await self.set_instant_manual_charge(
-                                    enable=True,
-                                    duration_minutes=self.charging_duration_minutes,
-                                    power_kw=self.charging_power
-                                )
-                                self.manual_charge_enabled = True
-                                self.diversion_guard_active = True
-                                self.diversion_discharge_polls = 0
-                            else:
-                                self.logger.debug(
-                                    f"Status: solar diversion charging, battery "
-                                    f"left alone (SOC: {battery_soc}%, "
-                                    f"Power: {battery_power}kW, discharge polls: "
-                                    f"{self.diversion_discharge_polls}/"
-                                    f"{self.diversion_sustained_polls})"
-                                )
+                            self.logger.debug(
+                                f"Status: solar diversion charging, battery "
+                                f"left free to feed the car (SOC: {battery_soc}%, "
+                                f"Power: {battery_power}kW)"
+                            )
                     elif battery_already_charging:
                         if self.manual_charge_enabled and self._manual_charge_expiring():
                             # Renew before the window lapses - reacting after
